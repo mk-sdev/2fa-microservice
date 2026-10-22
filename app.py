@@ -205,6 +205,14 @@ def confirm_2fa(user_id):
     If the code is valid, 2FA is enabled for the user.
     '''
 
+    action = "confirm-2fa"
+    try:
+        if is_rate_limited(user_id, action):
+            return jsonify({"error": "Too many attempts. Try again later."}), 429
+    except redis.RedisError:
+        app.logger.exception("Redis error during 2FA confirmation")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
+
     data = request.get_json(silent=True) or {}
     code = data.get("code")
 
@@ -241,6 +249,7 @@ def confirm_2fa(user_id):
             totp = pyotp.TOTP(secret)
 
             if not totp.verify(code, valid_window=1):
+                record_failed_attempt(user_id, action)
                 return jsonify({"error": "Invalid code"}), 401
 
             cur.execute("""
@@ -259,11 +268,18 @@ def confirm_2fa(user_id):
                 """, (user_id, ph.hash(backup_code)))
 
         conn.commit()
+        clear_failed_attempts(user_id, action)
 
         return jsonify({
             "message": "2FA enabled",
             "backup_codes": backup_codes  # shown only once to the user
         })
+
+    except redis.RedisError:
+        if conn:
+            conn.rollback()
+        app.logger.exception("Redis error during 2FA confirmation")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
 
     except Exception:
         if conn:
@@ -309,6 +325,9 @@ def disable_2fa(user_id):
         conn.close()
 
         return jsonify({"message": "2FA disabled and backup codes removed successfully"})
+    except redis.RedisError:
+        app.logger.exception("Redis error during backup code regeneration")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -354,10 +373,30 @@ def twofa_info(user_id):
     })
 
 
-def is_rate_limited(user_id, limit=5):
-    key = f"2fa:{user_id}"
-    attempts = r.get(key)
+RATE_LIMIT_ATTEMPTS = 5
+RATE_LIMIT_WINDOW_SECONDS = 300
+
+
+def rate_limit_key(user_id, action):
+    return f"rate-limit:{action}:{user_id}"
+
+
+def is_rate_limited(user_id, action, limit=RATE_LIMIT_ATTEMPTS):
+    attempts = r.get(rate_limit_key(user_id, action))
     return attempts is not None and int(attempts) >= limit
+
+
+def record_failed_attempt(user_id, action):
+    """Atomically count a failed attempt and start its fixed window."""
+    key = rate_limit_key(user_id, action)
+    with r.pipeline() as pipe:
+        pipe.incr(key)
+        pipe.expire(key, RATE_LIMIT_WINDOW_SECONDS, nx=True)
+        pipe.execute()
+
+
+def clear_failed_attempts(user_id, action):
+    r.delete(rate_limit_key(user_id, action))
 
 
 @app.route("/verify-2fa", methods=["PATCH"])
@@ -374,11 +413,11 @@ def verify_2fa(user_id):
     if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
         return jsonify({"error": "Missing or invalid 2FA code"}), 400
 
-    key = f"2fa:{user_id}"
+    action = "verify-2fa"
     conn = None
 
     try:
-        if is_rate_limited(user_id):
+        if is_rate_limited(user_id, action):
             return jsonify({
                 "error": "Too many attempts. Try again later."
             }), 429
@@ -406,15 +445,11 @@ def verify_2fa(user_id):
         totp = pyotp.TOTP(secret)
 
         if not totp.verify(code, valid_window=1):
-            # Increment attempt counter in Redis and set expiration if it's the first attempt
-            attempts = r.incr(key)
-
-            if attempts == 1:
-                r.expire(key, 300)  # 5 minutes
+            record_failed_attempt(user_id, action)
 
             return jsonify({"error": "Invalid code"}), 401
 
-        r.delete(key)  # reset attempt counter on successful verification
+        clear_failed_attempts(user_id, action)
 
         return make_auth_response(
             {"message": "2FA verified"},
@@ -438,55 +473,84 @@ def verify_2fa(user_id):
 @require_auth
 def verify_backup_code(user_id):
     """Verifies backup code using Argon2 hashes"""
-    code = request.json.get("code")
+    action = "verify-backup-code"
 
-    if not code:
+    try:
+        if is_rate_limited(user_id, action):
+            return jsonify({"error": "Too many attempts. Try again later."}), 429
+    except redis.RedisError:
+        app.logger.exception("Redis error during backup code verification")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
+
+    data = request.get_json(silent=True) or {}
+    code = data.get("code")
+
+    if not isinstance(code, str) or not code:
         return jsonify({"error": "Invalid request"}), 400
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
 
-    cur.execute(
-        "SELECT id, code FROM backup_codes WHERE user_id = %s",
-        (user_id,)
-    )
-    rows = cur.fetchall()
+        cur.execute(
+            "SELECT id, code FROM backup_codes WHERE user_id = %s",
+            (user_id,)
+        )
+        rows = cur.fetchall()
 
-    if not rows:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "No backup codes available"}), 400
+        if not rows:
+            return jsonify({"error": "No backup codes available"}), 400
 
-    matched_id = None
+        matched_id = None
 
-    for backup_id, code_hash in rows:
-        try:
-            if ph.verify(code_hash, code):
-                matched_id = backup_id
-                break
-        except VerifyMismatchError:
-            continue
+        for backup_id, code_hash in rows:
+            try:
+                if ph.verify(code_hash, code):
+                    matched_id = backup_id
+                    break
+            except VerifyMismatchError:
+                continue
 
-    if not matched_id:
-        cur.close()
-        conn.close()
-        return jsonify({"error": "Invalid backup code"}), 401
+        if not matched_id:
+            record_failed_attempt(user_id, action)
+            return jsonify({"error": "Invalid backup code"}), 401
 
-    # delete used code
-    cur.execute("DELETE FROM backup_codes WHERE id = %s", (matched_id,))
-    conn.commit()
+        # Consume the backup code once it has been verified.
+        cur.execute("DELETE FROM backup_codes WHERE id = %s", (matched_id,))
+        conn.commit()
+        clear_failed_attempts(user_id, action)
 
-    cur.close()
-    conn.close()
+        return make_auth_response({"message": "Backup code verified"}, user_id)
+    except redis.RedisError:
+        app.logger.exception("Redis error during backup code verification")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
+    except Exception:
+        app.logger.exception("Failed to verify backup code")
+        return jsonify({"error": "Unable to verify backup code"}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
-    return make_auth_response({"message": "Backup code verified"}, user_id)
 
 @app.route("/regenerate-backup-codes", methods=["POST"])
 @require_auth
 def regenerate_backup_codes(user_id):
-    password = request.json.get("password")
+    action = "regenerate-backup-codes"
+    try:
+        if is_rate_limited(user_id, action):
+            return jsonify({"error": "Too many attempts. Try again later."}), 429
+    except redis.RedisError:
+        app.logger.exception("Redis error during backup code regeneration")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
 
-    if not password:
+    data = request.get_json(silent=True) or {}
+    password = data.get("password")
+
+    if not isinstance(password, str) or not password:
         return jsonify({"error": "Password is required"}), 400
 
     try:
@@ -513,6 +577,7 @@ def regenerate_backup_codes(user_id):
         try:
             ph.verify(password_hash, password)
         except VerifyMismatchError:
+            record_failed_attempt(user_id, action)
             cur.close()
             conn.close()
             return jsonify({"error": "Invalid password"}), 401
@@ -535,6 +600,7 @@ def regenerate_backup_codes(user_id):
             )
 
         conn.commit()
+        clear_failed_attempts(user_id, action)
         cur.close()
         conn.close()
 
