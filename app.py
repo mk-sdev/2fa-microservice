@@ -5,6 +5,7 @@ import datetime
 import qrcode
 import io
 import base64
+import json
 import psycopg2
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -14,10 +15,22 @@ from cryptography.fernet import Fernet
 import string
 import random
 import secrets
+import logging
+from logging.handlers import RotatingFileHandler
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
 app = Flask(__name__)
+
+os.makedirs("logs", exist_ok=True)
+audit_handler = RotatingFileHandler(
+    "logs/flask-2fa-audit.log", maxBytes=10 * 1024 * 1024, backupCount=5
+)
+audit_handler.setFormatter(logging.Formatter("%(message)s"))
+audit_logger = logging.getLogger("audit")
+audit_logger.setLevel(logging.INFO)
+audit_logger.addHandler(audit_handler)
+audit_logger.propagate = False
 
 r = redis.Redis(host="redis", port=6379, db=0, decode_responses=True)
 
@@ -41,6 +54,25 @@ ISSUER = "IAM System"
 FERNET_KEY = os.getenv("TOTP_ENCRYPTION_KEY")
 
 fernet = Fernet(FERNET_KEY)
+
+
+def audit_log(level, user_id, action, details=None):
+    """Write Auth-Service-compatible JSON audit records without credentials."""
+    record = {
+        "level": logging.getLevelName(level).lower(),
+        "userId": str(user_id) if user_id is not None else "anonymous",
+        "action": action,
+        "details": {
+            "ip": request.headers.get(
+                "X-Forwarded-For", request.remote_addr or "unknown"
+            ).split(",")[0].strip(),
+            "path": request.path,
+            "method": request.method,
+            **(details or {}),
+        },
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    audit_logger.log(level, json.dumps(record, separators=(",", ":")))
 
 def encrypt_secret(secret: str) -> str:
     return fernet.encrypt(secret.encode()).decode()
@@ -208,6 +240,7 @@ def confirm_2fa(user_id):
     action = "confirm-2fa"
     try:
         if is_rate_limited(user_id, action):
+            audit_log(logging.WARNING, user_id, "2FA_CONFIRM_RATE_LIMITED")
             return jsonify({"error": "Too many attempts. Try again later."}), 429
     except redis.RedisError:
         app.logger.exception("Redis error during 2FA confirmation")
@@ -217,6 +250,7 @@ def confirm_2fa(user_id):
     code = data.get("code")
 
     if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
+        audit_log(logging.WARNING, user_id, "2FA_CONFIRM_INVALID_REQUEST")
         return jsonify({"error": "Invalid request"}), 400
 
     conn = None
@@ -250,6 +284,7 @@ def confirm_2fa(user_id):
 
             if not totp.verify(code, valid_window=1):
                 record_failed_attempt(user_id, action)
+                audit_log(logging.WARNING, user_id, "2FA_CONFIRM_INVALID_CODE")
                 return jsonify({"error": "Invalid code"}), 401
 
             cur.execute("""
@@ -269,6 +304,7 @@ def confirm_2fa(user_id):
 
         conn.commit()
         clear_failed_attempts(user_id, action)
+        audit_log(logging.INFO, user_id, "2FA_ENABLED")
 
         return jsonify({
             "message": "2FA enabled",
@@ -324,10 +360,8 @@ def disable_2fa(user_id):
         cur.close()
         conn.close()
 
+        audit_log(logging.INFO, user_id, "2FA_DISABLED")
         return jsonify({"message": "2FA disabled and backup codes removed successfully"})
-    except redis.RedisError:
-        app.logger.exception("Redis error during backup code regeneration")
-        return jsonify({"error": "Authentication temporarily unavailable"}), 503
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -418,6 +452,7 @@ def verify_2fa(user_id):
 
     try:
         if is_rate_limited(user_id, action):
+            audit_log(logging.WARNING, user_id, "2FA_VERIFY_RATE_LIMITED")
             return jsonify({
                 "error": "Too many attempts. Try again later."
             }), 429
@@ -446,10 +481,12 @@ def verify_2fa(user_id):
 
         if not totp.verify(code, valid_window=1):
             record_failed_attempt(user_id, action)
+            audit_log(logging.WARNING, user_id, "2FA_VERIFY_INVALID_CODE")
 
             return jsonify({"error": "Invalid code"}), 401
 
         clear_failed_attempts(user_id, action)
+        audit_log(logging.INFO, user_id, "2FA_VERIFIED")
 
         return make_auth_response(
             {"message": "2FA verified"},
@@ -477,6 +514,7 @@ def verify_backup_code(user_id):
 
     try:
         if is_rate_limited(user_id, action):
+            audit_log(logging.WARNING, user_id, "BACKUP_CODE_VERIFY_RATE_LIMITED")
             return jsonify({"error": "Too many attempts. Try again later."}), 429
     except redis.RedisError:
         app.logger.exception("Redis error during backup code verification")
@@ -486,6 +524,7 @@ def verify_backup_code(user_id):
     code = data.get("code")
 
     if not isinstance(code, str) or not code:
+        audit_log(logging.WARNING, user_id, "BACKUP_CODE_VERIFY_INVALID_REQUEST")
         return jsonify({"error": "Invalid request"}), 400
 
     conn = None
@@ -501,6 +540,7 @@ def verify_backup_code(user_id):
         rows = cur.fetchall()
 
         if not rows:
+            audit_log(logging.WARNING, user_id, "BACKUP_CODE_VERIFY_NO_CODES")
             return jsonify({"error": "No backup codes available"}), 400
 
         matched_id = None
@@ -515,6 +555,7 @@ def verify_backup_code(user_id):
 
         if not matched_id:
             record_failed_attempt(user_id, action)
+            audit_log(logging.WARNING, user_id, "BACKUP_CODE_VERIFY_INVALID")
             return jsonify({"error": "Invalid backup code"}), 401
 
         # Consume the backup code once it has been verified.
@@ -522,6 +563,7 @@ def verify_backup_code(user_id):
         conn.commit()
         clear_failed_attempts(user_id, action)
 
+        audit_log(logging.INFO, user_id, "BACKUP_CODE_VERIFIED")
         return make_auth_response({"message": "Backup code verified"}, user_id)
     except redis.RedisError:
         app.logger.exception("Redis error during backup code verification")
@@ -542,6 +584,7 @@ def regenerate_backup_codes(user_id):
     action = "regenerate-backup-codes"
     try:
         if is_rate_limited(user_id, action):
+            audit_log(logging.WARNING, user_id, "BACKUP_CODES_REGENERATE_RATE_LIMITED")
             return jsonify({"error": "Too many attempts. Try again later."}), 429
     except redis.RedisError:
         app.logger.exception("Redis error during backup code regeneration")
@@ -551,6 +594,7 @@ def regenerate_backup_codes(user_id):
     password = data.get("password")
 
     if not isinstance(password, str) or not password:
+        audit_log(logging.WARNING, user_id, "BACKUP_CODES_REGENERATE_INVALID_REQUEST")
         return jsonify({"error": "Password is required"}), 400
 
     try:
@@ -578,6 +622,7 @@ def regenerate_backup_codes(user_id):
             ph.verify(password_hash, password)
         except VerifyMismatchError:
             record_failed_attempt(user_id, action)
+            audit_log(logging.WARNING, user_id, "BACKUP_CODES_REGENERATE_INVALID_PASSWORD")
             cur.close()
             conn.close()
             return jsonify({"error": "Invalid password"}), 401
@@ -601,6 +646,12 @@ def regenerate_backup_codes(user_id):
 
         conn.commit()
         clear_failed_attempts(user_id, action)
+        audit_log(
+            logging.INFO,
+            user_id,
+            "BACKUP_CODES_REGENERATED",
+            {"count": len(new_codes)},
+        )
         cur.close()
         conn.close()
 
@@ -610,6 +661,9 @@ def regenerate_backup_codes(user_id):
             "backup_codes": new_codes
         })
 
+    except redis.RedisError:
+        app.logger.exception("Redis error during backup code regeneration")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
