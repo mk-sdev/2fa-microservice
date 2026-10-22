@@ -127,103 +127,154 @@ def require_auth(f):
         return f(user_id, *args, **kwargs)
     return wrapper
 
+
 @app.route("/enable-2fa", methods=["PATCH"])
 @require_auth
 def enable_2fa(user_id):
     '''
-    Generates a temporary secret for 2FA setup, creates a provisioning URI, and returns a QR code for the user to scan 
-    The temporary secret is stored in the database until the user confirms 2FA setup
+    Generates a secret for 2FA setup, creates a provisioning URI, and returns a QR code for the user to scan.
+    The secret is stored in otp_secret until the user confirms 2FA setup.
     '''
 
-    temp_secret = pyotp.random_base32()
-    encrypted_temp_secret = encrypt_secret(temp_secret)
+    conn = None
 
-    totp = pyotp.TOTP(temp_secret)
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
 
-    uri = totp.provisioning_uri(
-        name=str(user_id),
-        issuer_name=ISSUER
-    )
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT is_2fa_enabled
+                FROM users
+                WHERE _id = %s
+            """, (user_id,))
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+            row = cur.fetchone()
 
-    cur.execute("""
-        UPDATE users
-        SET otp_temp_secret = %s
-        WHERE _id = %s
-    """, (encrypted_temp_secret, user_id))
+            if not row:
+                return jsonify({"error": "User not found"}), 404
 
-    conn.commit()
-    cur.close()
-    conn.close()
+            if row[0]:
+                return jsonify({"error": "2FA is already enabled"}), 409
 
-    # QR
-    qr = qrcode.make(uri)
-    buffer = io.BytesIO()
-    qr.save(buffer, format="PNG")
+            secret = pyotp.random_base32()
+            encrypted_secret = encrypt_secret(secret)
 
-    qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+            cur.execute("""
+                UPDATE users
+                SET otp_secret = %s
+                WHERE _id = %s
+            """, (encrypted_secret, user_id))
 
-    return jsonify({
-        "qr_base64": qr_base64
-    })
+        conn.commit()
+
+        totp = pyotp.TOTP(secret)
+
+        uri = totp.provisioning_uri(
+            name=str(user_id),
+            issuer_name=ISSUER
+        )
+
+        # QR
+        qr = qrcode.make(uri)
+        buffer = io.BytesIO()
+        qr.save(buffer, format="PNG")
+
+        qr_base64 = base64.b64encode(buffer.getvalue()).decode()
+
+        return jsonify({
+            "qr_base64": qr_base64
+        })
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        app.logger.exception("Failed to initialize 2FA")
+        return jsonify({"error": "Unable to initialize 2FA"}), 500
+
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/confirm-2fa", methods=["POST"])
 @require_auth
 def confirm_2fa(user_id):
     '''
-    Verifies the 2FA code entered by the user against the temporary secret stored in the database
-    If the code is valid, the temporary secret is promoted to the permanent otp_secret, and 2FA is enabled for the user
+    Verifies the 2FA code entered by the user against the secret stored in the database.
+    If the code is valid, 2FA is enabled for the user.
     '''
-    code = request.json.get("code")
 
-    if not code:
+    data = request.get_json(silent=True) or {}
+    code = data.get("code")
+
+    if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
         return jsonify({"error": "Invalid request"}), 400
 
-    conn = psycopg2.connect(DATABASE_URL)
-    cur = conn.cursor()
+    conn = None
 
-    cur.execute("""
-        SELECT otp_temp_secret FROM users WHERE _id = %s
-    """, (user_id,))
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
 
-    row = cur.fetchone()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT otp_secret, is_2fa_enabled
+                FROM users
+                WHERE _id = %s
+                FOR UPDATE
+            """, (user_id,))
 
-    if not row or not row[0]:
-        return jsonify({"error": "2FA not initialized"}), 400
+            row = cur.fetchone()
 
-    temp_secret = decrypt_secret(row[0])
+            if not row:
+                return jsonify({"error": "User not found"}), 404
 
-    totp = pyotp.TOTP(temp_secret)
+            encrypted_secret, is_enabled = row
 
-    if not totp.verify(code, valid_window=1):
-        return jsonify({"error": "Invalid code"}), 401
+            if is_enabled:
+                return jsonify({"error": "2FA is already enabled"}), 409
 
-    encrypted_secret = encrypt_secret(temp_secret)
+            if not encrypted_secret:
+                return jsonify({"error": "2FA not initialized"}), 400
 
-    cur.execute("""
-        UPDATE users
-        SET otp_secret = %s,
-            otp_temp_secret = NULL,
-            is_2fa_enabled = TRUE
-        WHERE _id = %s
-    """, (encrypted_secret, user_id))
+            secret = decrypt_secret(encrypted_secret)
+            totp = pyotp.TOTP(secret)
 
-    conn.commit()
-    cur.close()
-    conn.close()
+            if not totp.verify(code, valid_window=1):
+                return jsonify({"error": "Invalid code"}), 401
 
-    # Po udanym potwierdzeniu 2FA
-    backup_codes = generate_backup_codes()
-    store_backup_codes(user_id, backup_codes)
+            cur.execute("""
+                UPDATE users
+                SET is_2fa_enabled = TRUE
+                WHERE _id = %s
+            """, (user_id,))
 
-    return jsonify({
-        "message": "2FA enabled",
-        "backup_codes": backup_codes  # shown only once to the user
-    })
+            # Generate backup codes after successful 2FA confirmation
+            backup_codes = generate_backup_codes()
 
+            for backup_code in backup_codes:
+                cur.execute("""
+                    INSERT INTO backup_codes (user_id, code)
+                    VALUES (%s, %s)
+                """, (user_id, ph.hash(backup_code)))
+
+        conn.commit()
+
+        return jsonify({
+            "message": "2FA enabled",
+            "backup_codes": backup_codes  # shown only once to the user
+        })
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        app.logger.exception("Failed to confirm 2FA")
+        return jsonify({"error": "Unable to confirm 2FA"}), 500
+
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/disable-2fa", methods=["PATCH"])
@@ -308,50 +359,79 @@ def is_rate_limited(user_id, limit=5):
     attempts = r.get(key)
     return attempts is not None and int(attempts) >= limit
 
+
 @app.route("/verify-2fa", methods=["PATCH"])
 @require_auth
 def verify_2fa(user_id):
     '''
-    Verifies the 2FA code entered by the user against the otp_secret stored in the database
-    If the code is valid, generates access and refresh tokens, and returns them in httpOnly cookies
+    Verifies the 2FA code entered by the user against the otp_secret stored in the database.
+    If the code is valid, generates access and refresh tokens.
     '''
-    
-    if is_rate_limited(user_id):
-        return jsonify({"error": "Too many attempts. Try again later."}), 429
 
-    code = request.json.get("code")
-    if not code:
-        return jsonify({"error": "Missing 2FA code"}), 400
+    data = request.get_json(silent=True) or {}
+    code = data.get("code")
+
+    if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
+        return jsonify({"error": "Missing or invalid 2FA code"}), 400
+
+    key = f"2fa:{user_id}"
+    conn = None
 
     try:
+        if is_rate_limited(user_id):
+            return jsonify({
+                "error": "Too many attempts. Try again later."
+            }), 429
+
         conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
 
-        cur.execute("SELECT otp_secret FROM users WHERE _id = %s", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT otp_secret, is_2fa_enabled
+                FROM users
+                WHERE _id = %s
+            """, (user_id,))
 
-        if not row or not row[0]:
+            row = cur.fetchone()
+
+        if not row:
+            return jsonify({"error": "User not found"}), 404
+
+        encrypted_secret, is_enabled = row
+
+        if not is_enabled or not encrypted_secret:
             return jsonify({"error": "2FA not enabled"}), 400
 
-        secret = decrypt_secret(row[0])
+        secret = decrypt_secret(encrypted_secret)
         totp = pyotp.TOTP(secret)
 
-        key = f"2fa:{user_id}"
-
         if not totp.verify(code, valid_window=1):
-            # increment attempt counter in Redis and set expiration if it's the first attempt
+            # Increment attempt counter in Redis and set expiration if it's the first attempt
             attempts = r.incr(key)
+
             if attempts == 1:
-                r.expire(key, 300)  # 5 min
+                r.expire(key, 300)  # 5 minutes
+
             return jsonify({"error": "Invalid code"}), 401
 
-        r.delete(f"2fa:{user_id}")  # reset attempt counter on successful verification
-        return make_auth_response({"message": "2FA verified"}, user_id)
+        r.delete(key)  # reset attempt counter on successful verification
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return make_auth_response(
+            {"message": "2FA verified"},
+            user_id
+        )
+
+    except redis.RedisError:
+        app.logger.exception("Redis error during 2FA verification")
+        return jsonify({"error": "Authentication temporarily unavailable"}), 503
+
+    except Exception:
+        app.logger.exception("Failed to verify 2FA")
+        return jsonify({"error": "Unable to verify 2FA"}), 500
+
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route("/verify-backup-code", methods=["DELETE"])
