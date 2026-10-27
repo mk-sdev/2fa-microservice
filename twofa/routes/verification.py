@@ -15,6 +15,7 @@ from ..security import (
     decrypt_secret,
     is_rate_limited,
     make_auth_response,
+    normalize_totp_code,
     record_failed_attempt,
     require_auth,
 )
@@ -30,9 +31,9 @@ def verify_2fa(user_id):
     '''
 
     data = request.get_json(silent=True) or {}
-    code = data.get("code")
+    code = normalize_totp_code(data.get("code"))
 
-    if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
+    if code is None:
         return jsonify({"error": "Missing or invalid 2FA code"}), 400
 
     action = "verify-2fa"

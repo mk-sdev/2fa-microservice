@@ -16,6 +16,7 @@ from ..security import (
     encrypt_secret,
     generate_backup_codes,
     is_rate_limited,
+    normalize_totp_code,
     ph,
     record_failed_attempt,
     require_auth,
@@ -111,9 +112,9 @@ def confirm_2fa(user_id):
         return jsonify({"error": "Authentication temporarily unavailable"}), 503
 
     data = request.get_json(silent=True) or {}
-    code = data.get("code")
+    code = normalize_totp_code(data.get("code"))
 
-    if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
+    if code is None:
         audit_log(logging.WARNING, user_id, "2FA_CONFIRM_INVALID_REQUEST")
         return jsonify({"error": "Invalid request"}), 400
 
@@ -198,37 +199,37 @@ def confirm_2fa(user_id):
 @require_auth
 def disable_2fa(user_id):
     '''
-    Disables 2FA for the user by clearing otp_secret, otp_temp_secret,
-    is_2fa_enabled, and deleting all backup codes for the user
+    Disables 2FA for the user by clearing otp_secret and deleting backup codes.
     '''
 
+    print(f"Disabling 2FA for user_id: {user_id}", flush=True)
+    conn = None
     try:
         conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM backup_codes
+                WHERE user_id = %s
+            """, (user_id,))
 
-        # remove backup codes
-        cur.execute("""
-            DELETE FROM backup_codes
-            WHERE user_id = %s
-        """, (user_id,))
-
-        # turn off 2FA and clear secrets
-        cur.execute("""
-            UPDATE users
-            SET otp_secret = NULL,
-                otp_temp_secret = NULL,
-                is_2fa_enabled = FALSE
-            WHERE _id = %s
-        """, (user_id,))
+            cur.execute("""
+                UPDATE users
+                SET otp_secret = NULL,
+                    is_2fa_enabled = FALSE
+                WHERE _id = %s
+            """, (user_id,))
 
         conn.commit()
-        cur.close()
-        conn.close()
-
         audit_log(logging.INFO, user_id, "2FA_DISABLED")
         return jsonify({"message": "2FA disabled and backup codes removed successfully"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        if conn:
+            conn.rollback()
+        current_app.logger.exception("Failed to disable 2FA")
+        return jsonify({"error": "Unable to disable 2FA"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 
@@ -271,7 +272,3 @@ def twofa_info(user_id):
         "isTwoFactorEnabled": is_2fa_enabled,
         "backupCodesLeft": backup_count
     })
-
-
-
-

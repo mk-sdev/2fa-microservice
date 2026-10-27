@@ -59,6 +59,17 @@ def generate_backup_codes(n=10, length=8):
     alphabet = string.ascii_uppercase + string.digits
     return [''.join(secrets.choice(alphabet) for _ in range(length)) for _ in range(n)]
 
+
+def normalize_totp_code(code):
+    """Return a six-digit TOTP string from a JSON string or integer."""
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int) and 0 <= code <= 999999:
+        return f"{code:06d}"
+    if isinstance(code, str) and len(code) == 6 and code.isdigit():
+        return code
+    return None
+
 ph = PasswordHasher()
 
 def store_backup_codes(user_id, codes):
