@@ -29,14 +29,27 @@ def decrypt_secret(encrypted_secret: str) -> str:
     return fernet.decrypt(encrypted_secret.encode()).decode()
 
 def generate_tokens(user_id):
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role FROM user_roles WHERE user_id = %s",
+                (user_id,),
+            )
+            roles = [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
     access_payload = {
         "sub": user_id,
+        "roles": roles,
         "2fa": True,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
     }
 
     refresh_payload = {
         "sub": user_id,
+        "roles": roles,
         "2fa": True,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
     }
