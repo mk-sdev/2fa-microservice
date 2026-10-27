@@ -63,6 +63,24 @@ def make_auth_response(payload, user_id):
     response = jsonify(payload)
 
     access_token, refresh_token = generate_tokens(user_id)
+    hashed_refresh_token = hash_preimage(refresh_token)
+
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO refresh_tokens (token, user_id)
+                VALUES (%s, %s)
+                """,
+                (hashed_refresh_token, user_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="lax", max_age=15*60)
     response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
