@@ -15,6 +15,7 @@ from ..security import (
     decrypt_secret,
     encrypt_secret,
     generate_backup_codes,
+    hash_preimage,
     is_rate_limited,
     normalize_totp_code,
     ph,
@@ -165,7 +166,7 @@ def confirm_2fa(user_id):
                 cur.execute("""
                     INSERT INTO backup_codes (user_id, code)
                     VALUES (%s, %s)
-                """, (user_id, ph.hash(backup_code)))
+                """, (user_id, hash_preimage(backup_code)))
 
         conn.commit()
         clear_failed_attempts(user_id, action)

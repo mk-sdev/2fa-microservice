@@ -12,11 +12,12 @@ from ..config import DATABASE_URL
 from ..security import (
     clear_failed_attempts,
     generate_backup_codes,
+    hash_preimage,
     is_rate_limited,
     make_auth_response,
-    ph,
     record_failed_attempt,
     require_auth,
+    verify_preimage,
 )
 
 bp = Blueprint('backup_codes', __name__)
@@ -62,7 +63,7 @@ def verify_backup_code(user_id):
 
         for backup_id, code_hash in rows:
             try:
-                if ph.verify(code_hash, code):
+                if verify_preimage(code_hash, code):
                     matched_id = backup_id
                     break
             except VerifyMismatchError:
@@ -135,7 +136,7 @@ def regenerate_backup_codes(user_id):
 
         # verify password using Argon2
         try:
-            ph.verify(password_hash, password)
+            verify_preimage(password_hash, password)
         except VerifyMismatchError:
             record_failed_attempt(user_id, action)
             audit_log(logging.WARNING, user_id, "BACKUP_CODES_REGENERATE_INVALID_PASSWORD")
@@ -154,7 +155,7 @@ def regenerate_backup_codes(user_id):
 
         # save them hashed in the database
         for code in new_codes:
-            hashed = ph.hash(code)
+            hashed = hash_preimage(code)
             cur.execute(
                 "INSERT INTO backup_codes (user_id, code) VALUES (%s, %s)",
                 (user_id, hashed)

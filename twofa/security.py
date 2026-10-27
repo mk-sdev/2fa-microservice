@@ -7,6 +7,7 @@ import jwt
 import psycopg2
 import redis
 from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
 from flask import jsonify, request
 
 from .config import (
@@ -14,6 +15,7 @@ from .config import (
     JWT_ACCESS_SECRET,
     JWT_2FA_SECRET,
     JWT_REFRESH_SECRET,
+    PEPPER,
     fernet,
 )
 
@@ -72,13 +74,26 @@ def normalize_totp_code(code):
 
 ph = PasswordHasher()
 
+
+def hash_preimage(preimage):
+    """Hash a value after appending the configured pepper."""
+    return ph.hash(preimage + PEPPER)
+
+
+def verify_preimage(hashed_value, preimage):
+    """Verify with pepper; optionally accept pre-pepper backup code hashes."""
+    try:
+        return ph.verify(hashed_value, preimage + PEPPER)
+    except VerifyMismatchError:
+        raise
+
 def store_backup_codes(user_id, codes):
     """Stores backup codes hashed with Argon2"""
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
 
     for code in codes:
-        hashed = ph.hash(code)
+        hashed = hash_preimage(code)
         cur.execute(
             "INSERT INTO backup_codes (user_id, code) VALUES (%s, %s)",
             (user_id, hashed)
