@@ -1,6 +1,7 @@
 import datetime
 import secrets
 import string
+import uuid
 from functools import wraps
 
 import jwt
@@ -40,29 +41,36 @@ def generate_tokens(user_id):
     finally:
         conn.close()
 
+    issued_at = datetime.datetime.now(datetime.timezone.utc)
+    refresh_token_id = str(uuid.uuid4())
+    refresh_expires = issued_at + datetime.timedelta(hours=1)
+
     access_payload = {
         "sub": user_id,
         "roles": roles,
         "2fa": True,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+        "exp": issued_at + datetime.timedelta(minutes=15),
     }
 
     refresh_payload = {
         "sub": user_id,
         "roles": roles,
         "2fa": True,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        "jti": refresh_token_id,
+        "exp": refresh_expires,
     }
 
     return (
         jwt.encode(access_payload, JWT_ACCESS_SECRET, algorithm="HS256"),
-        jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256")
+        jwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm="HS256"),
+        refresh_token_id,
+        refresh_expires,
     )
 
 def make_auth_response(payload, user_id):
     response = jsonify(payload)
 
-    access_token, refresh_token = generate_tokens(user_id)
+    access_token, refresh_token, token_id, token_expires = generate_tokens(user_id)
     hashed_refresh_token = hash_preimage(refresh_token)
 
     conn = psycopg2.connect(DATABASE_URL)
@@ -70,10 +78,10 @@ def make_auth_response(payload, user_id):
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO refresh_tokens (token, user_id)
-                VALUES (%s, %s)
+                INSERT INTO refresh_tokens (token, user_id, token_id, token_expires)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (hashed_refresh_token, user_id),
+                (hashed_refresh_token, user_id, token_id, token_expires),
             )
         conn.commit()
     except Exception:
