@@ -4,6 +4,7 @@ from flask_cors import CORS
 from .routes.backup_codes import bp as backup_codes_bp
 from .routes.settings import bp as settings_bp
 from .routes.verification import bp as verification_bp
+from .routes.webauthn import bp as webauthn_bp
 
 
 def create_app():
@@ -16,6 +17,7 @@ def create_app():
     app.register_blueprint(settings_bp)
     app.register_blueprint(verification_bp)
     app.register_blueprint(backup_codes_bp)
+    app.register_blueprint(webauthn_bp)
 
     @app.before_request
     def debug_request():

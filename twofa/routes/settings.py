@@ -40,7 +40,7 @@ def enable_2fa(user_id):
 
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT is_2fa_enabled
+                SELECT twofa_method
                 FROM users
                 WHERE _id = %s
             """, (user_id,))
@@ -50,8 +50,8 @@ def enable_2fa(user_id):
             if not row:
                 return jsonify({"error": "User not found"}), 404
 
-            if row[0]:
-                return jsonify({"error": "2FA is already enabled"}), 409
+            if row[0] == 'TOTP':
+                return jsonify({"error": "TOTP is already the active 2FA method"}), 409
 
             secret = pyotp.random_base32()
             encrypted_secret = encrypt_secret(secret)
@@ -126,7 +126,7 @@ def confirm_2fa(user_id):
 
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT otp_secret, is_2fa_enabled
+                SELECT otp_secret, twofa_method
                 FROM users
                 WHERE _id = %s
                 FOR UPDATE
@@ -137,10 +137,7 @@ def confirm_2fa(user_id):
             if not row:
                 return jsonify({"error": "User not found"}), 404
 
-            encrypted_secret, is_enabled = row
-
-            if is_enabled:
-                return jsonify({"error": "2FA is already enabled"}), 409
+            encrypted_secret, current_method = row
 
             if not encrypted_secret:
                 return jsonify({"error": "2FA not initialized"}), 400
@@ -155,18 +152,21 @@ def confirm_2fa(user_id):
 
             cur.execute("""
                 UPDATE users
-                SET is_2fa_enabled = TRUE
+                SET twofa_method = 'TOTP'
                 WHERE _id = %s
             """, (user_id,))
 
-            # Generate backup codes after successful 2FA confirmation
-            backup_codes = generate_backup_codes()
-
-            for backup_code in backup_codes:
-                cur.execute("""
-                    INSERT INTO backup_codes (user_id, code)
-                    VALUES (%s, %s)
-                """, (user_id, hash_preimage(backup_code)))
+            if current_method != 'TOTP':
+                cur.execute("DELETE FROM webauthn_credentials WHERE user_id = %s", (user_id,))
+                cur.execute("DELETE FROM backup_codes WHERE user_id = %s", (user_id,))
+                backup_codes = generate_backup_codes()
+                for backup_code in backup_codes:
+                    cur.execute("""
+                        INSERT INTO backup_codes (user_id, code)
+                        VALUES (%s, %s)
+                    """, (user_id, hash_preimage(backup_code)))
+            else:
+                backup_codes = []
 
         conn.commit()
         clear_failed_attempts(user_id, action)
@@ -200,7 +200,7 @@ def confirm_2fa(user_id):
 @require_auth
 def disable_2fa(user_id):
     '''
-    Disables 2FA for the user by clearing otp_secret and deleting backup codes.
+    Disables 2FA for the user and removes credentials and backup codes.
     '''
 
     print(f"Disabling 2FA for user_id: {user_id}", flush=True)
@@ -208,15 +208,21 @@ def disable_2fa(user_id):
     try:
         conn = psycopg2.connect(DATABASE_URL)
         with conn.cursor() as cur:
+            cur.execute("SELECT _id FROM users WHERE _id = %s FOR UPDATE", (user_id,))
+            if not cur.fetchone():
+                return jsonify({"error": "User not found"}), 404
+
             cur.execute("""
                 DELETE FROM backup_codes
                 WHERE user_id = %s
             """, (user_id,))
 
+            cur.execute("DELETE FROM webauthn_credentials WHERE user_id = %s", (user_id,))
+
             cur.execute("""
                 UPDATE users
                 SET otp_secret = NULL,
-                    is_2fa_enabled = FALSE
+                    twofa_method = NULL
                 WHERE _id = %s
             """, (user_id,))
 
@@ -245,7 +251,7 @@ def twofa_info(user_id):
 
     # 1. 2FA status
     cur.execute("""
-        SELECT is_2fa_enabled
+        SELECT twofa_method
         FROM users
         WHERE _id = %s
     """, (user_id,))
@@ -256,7 +262,7 @@ def twofa_info(user_id):
         conn.close()
         return jsonify({"error": "User not found"}), 404
 
-    is_2fa_enabled = user_row[0]
+    method = user_row[0]
 
     # 2. backup codes count
     cur.execute("""
@@ -266,10 +272,15 @@ def twofa_info(user_id):
     """, (user_id,))
     backup_count = cur.fetchone()[0]
 
+    cur.execute("SELECT credential_id, name FROM webauthn_credentials WHERE user_id = %s ORDER BY name", (user_id,))
+    credentials = [{"credential_id": row[0], "name": row[1]} for row in cur.fetchall()]
+
     cur.close()
     conn.close()
 
     return jsonify({
-        "isTwoFactorEnabled": is_2fa_enabled,
-        "backupCodesLeft": backup_count
+        "isTwoFactorEnabled": method is not None,
+        "twoFactorMethod": method,
+        "backupCodesLeft": backup_count,
+        "webAuthnCredentials": credentials,
     })

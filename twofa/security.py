@@ -92,6 +92,7 @@ def make_auth_response(payload, user_id):
 
     response.set_cookie("access_token", access_token, httponly=True, secure=False, samesite="lax", max_age=15*60)
     response.set_cookie("refresh_token", refresh_token, httponly=True, secure=False, samesite="lax", max_age=60*60)
+    response.delete_cookie("2fa_token", httponly=True, secure=False, samesite="lax", path="/")
 
     return response
 
@@ -143,26 +144,63 @@ def store_backup_codes(user_id, codes):
     conn.close()
 
 def get_user_id_from_token():
-    '''
-    Helper fucntion to extract user ID from either access token or 2fa token in cookies
-    '''
-    token = request.cookies.get("access_token") or request.cookies.get("2fa_token")
+    """Return the subject of the authenticated, full access-token session."""
+    token = request.cookies.get("access_token")
     if not token:
         return None
 
     try:
-        if request.cookies.get("2fa_token") == token:
-            payload = jwt.decode(token, JWT_2FA_SECRET, algorithms=["HS256"])
-        else:
-            payload = jwt.decode(token, JWT_ACCESS_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(token, JWT_ACCESS_SECRET, algorithms=["HS256"])
         return payload.get("sub")
     except Exception:
         return None
+
+
+def get_2fa_user_id():
+    """Return the subject only from the short-lived password-verified 2FA token."""
+    token = request.cookies.get("2fa_token")
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_2FA_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "2fa" or not payload.get("jti"):
+            return None
+        if r.exists(f"used-2fa-token:{payload['jti']}"):
+            return None
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
+def consume_2fa_token():
+    """Atomically mark the current MFA challenge token as used after success."""
+    token = request.cookies.get("2fa_token")
+    if not token:
+        return False
+    try:
+        payload = jwt.decode(token, JWT_2FA_SECRET, algorithms=["HS256"])
+        token_id = payload.get("jti")
+        ttl = max(1, int(payload.get("exp", 0) - datetime.datetime.now(datetime.timezone.utc).timestamp()))
+        if payload.get("type") != "2fa" or not token_id:
+            return False
+        return bool(r.set(f"used-2fa-token:{token_id}", "1", ex=ttl, nx=True))
+    except Exception:
+        return False
 
 def require_auth(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         user_id = get_user_id_from_token()
+        if not user_id:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(user_id, *args, **kwargs)
+    return wrapper
+
+
+def require_2fa(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user_id = get_2fa_user_id()
         if not user_id:
             return jsonify({"error": "Unauthorized"}), 401
         return f(user_id, *args, **kwargs)

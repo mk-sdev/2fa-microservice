@@ -8,3 +8,4 @@ python-dotenv
 redis
 cryptography
 argon2-cffi
+webauthn==2.2.0

@@ -1,4 +1,4 @@
-A microservice for 2FA using TOTP written in Flask.
+A microservice for 2FA using TOTP or WebuAthn written in Flask.
 
 .env file structure:
 
@@ -9,4 +9,7 @@ JWT_2FA_SECRET=
 DATABASE_URL=
 TOTP_ENCRYPTION_KEY=
 PEPPER=
+WEBAUTHN_RP_ID=
+WEBAUTHN_RP_NAME=
+WEBAUTHN_ORIGIN=
 ```

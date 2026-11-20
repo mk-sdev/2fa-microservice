@@ -12,18 +12,19 @@ from ..audit import audit_log
 from ..config import DATABASE_URL
 from ..security import (
     clear_failed_attempts,
+    consume_2fa_token,
     decrypt_secret,
     is_rate_limited,
     make_auth_response,
     normalize_totp_code,
     record_failed_attempt,
-    require_auth,
+    require_2fa,
 )
 
 bp = Blueprint('verification', __name__)
 
 @bp.route("/verify-2fa", methods=["PATCH"])
-@require_auth
+@require_2fa
 def verify_2fa(user_id):
     '''
     Verifies the 2FA code entered by the user against the otp_secret stored in the database.
@@ -50,7 +51,7 @@ def verify_2fa(user_id):
 
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT otp_secret, is_2fa_enabled
+                SELECT otp_secret, twofa_method
                 FROM users
                 WHERE _id = %s
             """, (user_id,))
@@ -60,10 +61,10 @@ def verify_2fa(user_id):
         if not row:
             return jsonify({"error": "User not found"}), 404
 
-        encrypted_secret, is_enabled = row
+        encrypted_secret, method = row
 
-        if not is_enabled or not encrypted_secret:
-            return jsonify({"error": "2FA not enabled"}), 400
+        if method != "TOTP" or not encrypted_secret:
+            return jsonify({"error": "TOTP is not the active 2FA method"}), 400
 
         secret = decrypt_secret(encrypted_secret)
         totp = pyotp.TOTP(secret)
@@ -73,6 +74,9 @@ def verify_2fa(user_id):
             audit_log(logging.WARNING, user_id, "2FA_VERIFY_INVALID_CODE")
 
             return jsonify({"error": "Invalid code"}), 401
+
+        if not consume_2fa_token():
+            return jsonify({"error": "This login challenge was already used"}), 401
 
         clear_failed_attempts(user_id, action)
         audit_log(logging.INFO, user_id, "2FA_VERIFIED")

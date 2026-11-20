@@ -11,19 +11,21 @@ from ..audit import audit_log
 from ..config import DATABASE_URL
 from ..security import (
     clear_failed_attempts,
+    consume_2fa_token,
     generate_backup_codes,
     hash_preimage,
     is_rate_limited,
     make_auth_response,
     record_failed_attempt,
     require_auth,
+    require_2fa,
     verify_preimage,
 )
 
 bp = Blueprint('backup_codes', __name__)
 
 @bp.route("/verify-backup-code", methods=["DELETE"])
-@require_auth
+@require_2fa
 def verify_backup_code(user_id):
     """Verifies backup code using Argon2 hashes"""
     action = "verify-backup-code"
@@ -49,6 +51,11 @@ def verify_backup_code(user_id):
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
 
+        cur.execute("SELECT twofa_method FROM users WHERE _id = %s", (user_id,))
+        method_row = cur.fetchone()
+        if not method_row or method_row[0] is None:
+            return jsonify({"error": "2FA is not enabled"}), 400
+
         cur.execute(
             "SELECT id, code FROM backup_codes WHERE user_id = %s",
             (user_id,)
@@ -73,6 +80,9 @@ def verify_backup_code(user_id):
             record_failed_attempt(user_id, action)
             audit_log(logging.WARNING, user_id, "BACKUP_CODE_VERIFY_INVALID")
             return jsonify({"error": "Invalid backup code"}), 401
+
+        if not consume_2fa_token():
+            return jsonify({"error": "This login challenge was already used"}), 401
 
         # Consume the backup code once it has been verified.
         cur.execute("DELETE FROM backup_codes WHERE id = %s", (matched_id,))
